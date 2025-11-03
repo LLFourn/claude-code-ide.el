@@ -584,13 +584,14 @@ displayed fullscreen in that frame instead."
                            (frame-list)))
          (window
           (if monitor-2-frame
-              ;; Display in monitor-2 frame fullscreen
-              (progn
-                (with-selected-frame monitor-2-frame
-                  (switch-to-buffer buffer)
-                  (delete-other-windows))
-                (select-frame-set-input-focus monitor-2-frame)
-                (selected-window))
+              ;; Display in monitor-2 frame fullscreen using proper display-buffer
+              (display-buffer buffer
+                              `((display-buffer-use-some-frame
+                                 display-buffer-full-frame)
+                                (frame-predicate . ,(lambda (frame)
+                                                      (equal (frame-parameter frame 'title)
+                                                             "emacs-monitor-2")))
+                                (inhibit-switch-frame . ,(not claude-code-ide-focus-on-open))))
             ;; No monitor-2 frame, use normal behavior
             (if claude-code-ide-use-side-window
                 ;; Use side window
@@ -612,7 +613,7 @@ displayed fullscreen in that frame instead."
               (display-buffer buffer)))))
     ;; Update last accessed buffer whenever we display a Claude buffer
     (setq claude-code-ide--last-accessed-buffer buffer)
-    ;; For monitor-2-frame, we already focused it above, so skip the select-window
+    ;; For monitor-2-frame, display-buffer already handled focus based on inhibit-switch-frame
     (when (and window claude-code-ide-focus-on-open (not monitor-2-frame))
       (select-window window))
     ;; For bottom/top windows, explicitly set and preserve the height
