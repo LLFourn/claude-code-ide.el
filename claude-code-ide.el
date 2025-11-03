@@ -1178,6 +1178,103 @@ If no Claude windows are visible, show the most recently accessed one."
      (t
       (user-error "No recent Claude Code session to toggle")))))
 
+(defun claude-code-ide--auto-switch-on-project-change ()
+  "Automatically switch to or resume Claude session on monitor-2 when changing projects.
+This function is designed to be called from projectile hooks and will not
+steal focus from the current frame."
+  (when (and (boundp 'projectile-mode)
+             projectile-mode
+             (projectile-project-p))
+    (let* ((monitor-2-frame (cl-find-if
+                             (lambda (f)
+                               (equal (frame-parameter f 'title) "emacs-monitor-2"))
+                             (frame-list)))
+           (current-frame (selected-frame)))
+      (if monitor-2-frame
+          (progn
+            (let* ((working-dir (claude-code-ide--get-working-directory))
+                   (buffer-name (claude-code-ide--get-buffer-name))
+                   (existing-buffer (get-buffer buffer-name))
+                   (existing-process (claude-code-ide--get-process working-dir)))
+              (if (and existing-buffer
+                       (buffer-live-p existing-buffer)
+                       existing-process)
+                  ;; Session exists, display it on monitor-2 without focus
+                  (with-selected-frame monitor-2-frame
+                    (switch-to-buffer existing-buffer)
+                    (delete-other-windows))
+                ;; No session, start one with continue flag on monitor-2
+                (when (claude-code-ide--ensure-cli)
+                  (claude-code-ide--cleanup-dead-processes)
+                  (claude-code-ide--terminal-ensure-backend)
+                  (let ((port nil)
+                        (session-id (format "claude-%s-%s"
+                                            (file-name-nondirectory (directory-file-name working-dir))
+                                            (format-time-string "%Y%m%d-%H%M%S"))))
+                    (condition-case err
+                        (progn
+                          (setq port (claude-code-ide-mcp-start working-dir))
+                          (let* ((buffer-and-process (claude-code-ide--create-terminal-session
+                                                      buffer-name working-dir port t nil session-id))
+                                 (buffer (car buffer-and-process))
+                                 (process (cdr buffer-and-process)))
+                            (claude-code-ide-mcp-server-session-started session-id working-dir buffer)
+                            (claude-code-ide--set-process process working-dir)
+                            (puthash working-dir session-id claude-code-ide--session-ids)
+                            (set-process-sentinel process
+                                                  (lambda (_proc event)
+                                                    (when (string-match "exited abnormally with code \\([0-9]+\\)" event)
+                                                      (let ((exit-code (match-string 1 event)))
+                                                        (claude-code-ide-debug "Claude process exited with code %s, event: %s"
+                                                                               exit-code event)
+                                                        (message "Claude exited with error code %s" exit-code)))
+                                                    (when (or (string-match "finished" event)
+                                                              (string-match "exited" event)
+                                                              (string-match "killed" event)
+                                                              (string-match "terminated" event))
+                                                      (claude-code-ide--cleanup-on-exit working-dir))))
+                            (with-current-buffer buffer
+                              (add-hook 'kill-buffer-hook
+                                        (lambda ()
+                                          (claude-code-ide--cleanup-on-exit working-dir))
+                                        nil t)
+                              (claude-code-ide--setup-terminal-keybindings)
+                              (cond
+                               ((eq claude-code-ide-terminal-backend 'vterm)
+                                (add-hook 'vterm-exit-functions
+                                          (lambda (&rest _)
+                                            (when (buffer-live-p buffer)
+                                              (kill-buffer buffer)))
+                                          nil t))
+                               ((eq claude-code-ide-terminal-backend 'eat)
+                                nil)))
+                            ;; Display on monitor-2 without focus
+                            (with-selected-frame monitor-2-frame
+                              (switch-to-buffer buffer)
+                              (delete-other-windows))))
+                      (error
+                       (claude-code-ide-debug "Failed to auto-start Claude session: %s" err)))))))
+            ;; Restore focus to original frame
+            (select-frame-set-input-focus current-frame))))))
+
+;;;###autoload
+(defun claude-code-ide-enable-auto-switch ()
+  "Enable automatic switching to Claude sessions when changing projects.
+When enabled, Claude will automatically resume or switch sessions on
+monitor-2 when you change projects, without stealing focus."
+  (interactive)
+  (add-hook 'projectile-after-switch-project-hook
+            #'claude-code-ide--auto-switch-on-project-change)
+  (message "Claude Code auto-switch enabled"))
+
+;;;###autoload
+(defun claude-code-ide-disable-auto-switch ()
+  "Disable automatic switching to Claude sessions when changing projects."
+  (interactive)
+  (remove-hook 'projectile-after-switch-project-hook
+               #'claude-code-ide--auto-switch-on-project-change)
+  (message "Claude Code auto-switch disabled"))
+
 (provide 'claude-code-ide)
 
 ;;; claude-code-ide.el ends here
