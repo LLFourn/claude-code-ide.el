@@ -1116,6 +1116,30 @@ Use this to balance between visual smoothness and raw responsiveness."
              "disabled (direct rendering, maximum responsiveness)")))
 
 ;;;###autoload
+(defun claude-code-ide-force-resize ()
+  "Force the current vterm buffer to resize to the current window dimensions.
+This works by toggling fullscreen off and back on, giving the window system
+time to fully redraw in each state, which triggers Claude Code to re-detect
+the terminal size."
+  (interactive)
+  (if (eq claude-code-ide-terminal-backend 'vterm)
+      (if (and (boundp 'vterm--process)
+               vterm--process
+               (process-live-p vterm--process))
+          (let ((frame (selected-frame)))
+            (message "Forcing vterm resize by toggling fullscreen off...")
+            ;; Toggle fullscreen OFF
+            (toggle-frame-fullscreen frame)
+            (sit-for 1.0)  ; Wait for the toggle to complete and redraw
+            (message "Toggling fullscreen back on...")
+            ;; Toggle fullscreen back ON
+            (toggle-frame-fullscreen frame)
+            (sit-for 1.0)  ; Wait for the toggle to complete and redraw
+            (message "Vterm resize complete"))
+        (user-error "No live vterm process in current buffer"))
+    (user-error "Not using vterm backend")))
+
+;;;###autoload
 (defun claude-code-ide-send-prompt (&optional prompt)
   "Send a prompt to the Claude Code terminal.
 When called interactively, reads a prompt from the minibuffer.
