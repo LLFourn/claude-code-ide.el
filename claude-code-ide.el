@@ -574,30 +574,46 @@ If DIRECTORY is not provided, use the current working directory."
 The window is displayed on the side specified by
 `claude-code-ide-window-side' with dimensions from
 `claude-code-ide-window-width' or `claude-code-ide-window-height'.
-If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
-  (let ((window
-         (if claude-code-ide-use-side-window
-             ;; Use side window
-             (let* ((side claude-code-ide-window-side)
-                    (slot 0)
-                    (window-parameters '((no-delete-other-windows . t)))
-                    (display-buffer-alist
-                     `((,(regexp-quote (buffer-name buffer))
-                        (display-buffer-in-side-window)
-                        (side . ,side)
-                        (slot . ,slot)
-                        ,@(when (memq side '(left right))
-                            `((window-width . ,claude-code-ide-window-width)))
-                        ,@(when (memq side '(top bottom))
-                            `((window-height . ,claude-code-ide-window-height)))
-                        (window-parameters . ,window-parameters)))))
-               (display-buffer buffer))
-           ;; Use regular buffer
-           (display-buffer buffer))))
+If `claude-code-ide-focus-on-open' is non-nil, the window is selected.
+
+If a frame with title \"emacs-monitor-2\" exists, the buffer will be
+displayed fullscreen in that frame instead."
+  (let* ((monitor-2-frame (cl-find-if
+                           (lambda (f)
+                             (equal (frame-parameter f 'title) "emacs-monitor-2"))
+                           (frame-list)))
+         (window
+          (if monitor-2-frame
+              ;; Display in monitor-2 frame fullscreen
+              (progn
+                (with-selected-frame monitor-2-frame
+                  (switch-to-buffer buffer)
+                  (delete-other-windows))
+                (select-frame-set-input-focus monitor-2-frame)
+                (selected-window))
+            ;; No monitor-2 frame, use normal behavior
+            (if claude-code-ide-use-side-window
+                ;; Use side window
+                (let* ((side claude-code-ide-window-side)
+                       (slot 0)
+                       (window-parameters '((no-delete-other-windows . t)))
+                       (display-buffer-alist
+                        `((,(regexp-quote (buffer-name buffer))
+                           (display-buffer-in-side-window)
+                           (side . ,side)
+                           (slot . ,slot)
+                           ,@(when (memq side '(left right))
+                               `((window-width . ,claude-code-ide-window-width)))
+                           ,@(when (memq side '(top bottom))
+                               `((window-height . ,claude-code-ide-window-height)))
+                           (window-parameters . ,window-parameters)))))
+                  (display-buffer buffer))
+              ;; Use regular buffer
+              (display-buffer buffer)))))
     ;; Update last accessed buffer whenever we display a Claude buffer
     (setq claude-code-ide--last-accessed-buffer buffer)
-    ;; Select the window to give it focus if configured to do so
-    (when (and window claude-code-ide-focus-on-open)
+    ;; For monitor-2-frame, we already focused it above, so skip the select-window
+    (when (and window claude-code-ide-focus-on-open (not monitor-2-frame))
       (select-window window))
     ;; For bottom/top windows, explicitly set and preserve the height
     (when (and window
