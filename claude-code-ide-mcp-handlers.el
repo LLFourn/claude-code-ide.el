@@ -556,7 +556,8 @@ ARGUMENTS should contain:
                 (unwind-protect
                     (progn
                       (setq ediff-window-setup-function 'ediff-setup-windows-plain
-                            ediff-split-window-function 'split-window-horizontally)
+                            ;; Split vertically (stacked) instead of horizontally (side-by-side)
+                            ediff-split-window-function 'split-window-vertically)
                       (ediff-buffers buffer-A buffer-B))
                   ;; Restore original values
                   (setq ediff-window-setup-function old-setup-fn
