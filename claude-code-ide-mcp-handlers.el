@@ -199,16 +199,34 @@ STARTUP-HOOK-FN is the hook function to remove after use."
     ;; Jump to the first difference if there are any
     (ignore-errors (ediff-next-difference))
 
-    ;; Always focus Claude window after ediff starts
-    (when-let* ((project-dir (claude-code-ide-mcp-session-project-dir session))
-                (claude-buffer-name (claude-code-ide--get-buffer-name project-dir))
-                (claude-buffer (get-buffer claude-buffer-name)))
-      (when (buffer-live-p claude-buffer)
-        ;; Find Claude window across all frames
-        (when-let ((claude-window (get-buffer-window claude-buffer t)))
-          ;; Switch to Claude's frame and window
-          (select-frame-set-input-focus (window-frame claude-window))
-          (select-window claude-window))))
+    ;; Handle post-ediff focus
+    (let ((monitor-2-frame (cl-find-if
+                            (lambda (f)
+                              (equal (frame-parameter f 'title) "emacs-monitor-2"))
+                            (frame-list))))
+      (if monitor-2-frame
+          ;; 🖥️ Dual-monitor: always focus Claude on monitor-2
+          (when-let* ((project-dir (claude-code-ide-mcp-session-project-dir session))
+                      (claude-buffer-name (claude-code-ide--get-buffer-name project-dir))
+                      (claude-buffer (get-buffer claude-buffer-name)))
+            (when (buffer-live-p claude-buffer)
+              (when-let ((claude-window (get-buffer-window claude-buffer t)))
+                (select-frame-set-input-focus (window-frame claude-window))
+                (select-window claude-window))))
+        ;; Single-monitor: use upstream behavior
+        (let ((original-window (selected-window))
+              (claude-window nil))
+          (when claude-code-ide-show-claude-window-in-ediff
+            (when-let* ((project-dir (claude-code-ide-mcp-session-project-dir session))
+                        (claude-buffer-name (claude-code-ide--get-buffer-name project-dir))
+                        (claude-buffer (get-buffer claude-buffer-name)))
+              (when (buffer-live-p claude-buffer)
+                (setq claude-window (claude-code-ide--display-buffer-in-side-window claude-buffer)))))
+          (cond
+           ((and claude-code-ide-focus-claude-after-ediff claude-window)
+            (select-window claude-window))
+           (t
+            (select-window original-window))))))
 
     ;; Remove this startup hook after use
     (remove-hook 'ediff-startup-hook startup-hook-fn)))
@@ -498,14 +516,14 @@ ARGUMENTS should contain:
               ;; Switch to the original tab
               (tab-bar-select-tab-by-name (alist-get 'name original-tab)))))))
 
-    ;; Find monitor-1 frame if it exists, otherwise use current frame
+    ;; Find monitor-1 frame for dual-monitor setup, otherwise use current frame
     (let* ((monitor-1-frame (cl-find-if
                              (lambda (f)
                                (equal (frame-parameter f 'title) "emacs-monitor-1"))
                              (frame-list)))
+           (dual-monitor-p monitor-1-frame)
            (ediff-frame (or monitor-1-frame (selected-frame))))
 
-      ;; Switch to the frame where ediff will open and save its window config
       (with-selected-frame ediff-frame
         (let* ((saved-winconf (current-window-configuration))
                (buffers (claude-code-ide-mcp--create-diff-buffers
@@ -523,7 +541,7 @@ ARGUMENTS should contain:
                        (new-file-path . ,new-file-path)
                        (file-exists . ,file-exists)
                        (saved-winconf . ,saved-winconf)
-                       (session . ,session)  ; Store the session reference
+                       (session . ,session)
                        (created-at . ,(current-time)))
                      active-diffs))
 
@@ -532,44 +550,49 @@ ARGUMENTS should contain:
                  (before-setup-hook-fn (car hooks))
                  (startup-hook-fn (cdr hooks)))
 
-            ;; Add hooks
             (add-hook 'ediff-before-setup-hook before-setup-hook-fn)
             (add-hook 'ediff-startup-hook startup-hook-fn)
 
-            ;; Start ediff
             (condition-case err
-                (progn
-                  ;; Start ediff with plain window setup (control panel at bottom)
-                  ;; Set a unique control buffer suffix to avoid conflicts with other ediff sessions
-                  (let ((old-setup-fn ediff-window-setup-function)
-                        (old-split-fn ediff-split-window-function)
-                        ;; Use tab-name to create a unique suffix for this ediff session
-                        (ediff-control-buffer-suffix (format "<%s>" tab-name)))
-                    (unwind-protect
-                        (progn
-                          (setq ediff-window-setup-function 'ediff-setup-windows-plain
-                                ;; Split vertically (stacked) instead of horizontally (side-by-side)
-                                ediff-split-window-function 'split-window-vertically)
-                          (ediff-buffers buffer-A buffer-B))
-                      ;; Restore original values
-                      (setq ediff-window-setup-function old-setup-fn
-                            ediff-split-window-function old-split-fn))))
+                (if dual-monitor-p
+                    ;; 🖥️ Dual-monitor: vertical split, no side window cleanup needed
+                    (let ((old-setup-fn ediff-window-setup-function)
+                          (old-split-fn ediff-split-window-function)
+                          (ediff-control-buffer-suffix (format "<%s>" tab-name)))
+                      (unwind-protect
+                          (progn
+                            (setq ediff-window-setup-function 'ediff-setup-windows-plain
+                                  ediff-split-window-function 'split-window-vertically)
+                            (ediff-buffers buffer-A buffer-B))
+                        (setq ediff-window-setup-function old-setup-fn
+                              ediff-split-window-function old-split-fn)))
+                  ;; Single-monitor: upstream behavior
+                  (progn
+                    (dolist (window (window-list))
+                      (when (window-parameter window 'window-side)
+                        (delete-window window)))
+                    (let ((old-setup-fn ediff-window-setup-function)
+                          (old-split-fn ediff-split-window-function)
+                          (ediff-control-buffer-suffix (format "<%s>" tab-name)))
+                      (unwind-protect
+                          (progn
+                            (setq ediff-window-setup-function 'ediff-setup-windows-plain
+                                  ediff-split-window-function 'split-window-horizontally)
+                            (ediff-buffers buffer-A buffer-B))
+                        (setq ediff-window-setup-function old-setup-fn
+                              ediff-split-window-function old-split-fn)))))
               (error
-               ;; Handle ediff startup errors
                (when buffer-B
                  (kill-buffer buffer-B))
                (let ((active-diffs (claude-code-ide-mcp--get-active-diffs session)))
                  (remhash tab-name active-diffs))
-               ;; Remove the hooks we added
                (remove-hook 'ediff-before-setup-hook before-setup-hook-fn)
                (remove-hook 'ediff-startup-hook startup-hook-fn)
-               ;; Re-signal the error
                (signal (car err) (cdr err))))
 
-            ;; Return deferred indicator with session
             `((deferred . t)
               (unique-key . ,tab-name)
-              (session . ,session)))))))
+              (session . ,session))))))))
 
 (defun claude-code-ide-mcp--handle-ediff-quit (tab-name &optional session)
   "Handle ediff quit for TAB-NAME.
