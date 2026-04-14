@@ -41,6 +41,10 @@
 (declare-function claude-code-ide-mcp-session-active-diffs "claude-code-ide-mcp" (session))
 (declare-function claude-code-ide-mcp-session-original-tab "claude-code-ide-mcp" (session))
 (declare-function claude-code-ide-mcp-session-project-dir "claude-code-ide-mcp" (session))
+(declare-function claude-code-ide-mcp-session-reference-window "claude-code-ide-mcp" (session))
+(declare-function claude-code-ide-mcp-session-reference-overlay "claude-code-ide-mcp" (session))
+(declare-function claude-code-ide-mcp-session-set-reference-window "claude-code-ide-mcp" (session val))
+(declare-function claude-code-ide-mcp-session-set-reference-overlay "claude-code-ide-mcp" (session val))
 (declare-function claude-code-ide-mcp--setup-buffer-cache-hooks "claude-code-ide-mcp" ())
 (declare-function claude-code-ide--get-buffer-name "claude-code-ide" (&optional directory))
 (declare-function claude-code-ide--display-buffer-in-side-window "claude-code-ide" (buffer))
@@ -741,6 +745,97 @@ ARGUMENTS should contain `filePath`."
           `((isDirty . ,(if (buffer-modified-p buffer) t :json-false)))
         `((isDirty . :json-false))))))
 
+;;; Reference Window
+
+(defun claude-code-ide-mcp--get-main-frame (session)
+  "Return the main editing frame for SESSION.
+Finds a frame that does not contain the Claude terminal buffer."
+  (when-let* ((project-dir (claude-code-ide-mcp-session-project-dir session))
+              (claude-buffer-name (claude-code-ide--get-buffer-name project-dir))
+              (claude-buffer (get-buffer claude-buffer-name))
+              (claude-window (get-buffer-window claude-buffer t))
+              (claude-frame (window-frame claude-window)))
+    (or (cl-find-if (lambda (f) (not (eq f claude-frame))) (frame-list))
+        claude-frame)))
+
+(defun claude-code-ide-mcp--rightmost-editing-window (frame)
+  "Return the rightmost non-side window in FRAME."
+  (let* ((wins (cl-remove-if (lambda (w) (window-parameter w 'window-side))
+                              (window-list frame nil)))
+         (sorted (sort (copy-sequence wins)
+                       (lambda (a b) (> (window-left-column a) (window-left-column b))))))
+    (or (car sorted) (frame-root-window frame))))
+
+(defun claude-code-ide-mcp--get-or-create-reference-window (session)
+  "Return the live reference window for SESSION, creating one if needed."
+  (let ((win (claude-code-ide-mcp-session-reference-window session)))
+    (if (and win (window-live-p win))
+        win
+      (let* ((frame (or (claude-code-ide-mcp--get-main-frame session) (selected-frame)))
+             (rightmost (claude-code-ide-mcp--rightmost-editing-window frame))
+             (new-win (split-window rightmost nil 'right)))
+        (claude-code-ide-mcp-session-set-reference-window session new-win)
+        new-win))))
+
+(defun claude-code-ide-mcp-handle-open-reference-window (arguments session)
+  "Open a file in the session-owned reference window on the main frame.
+ARGUMENTS:
+- `path' (required): File path to open
+- `line' (optional): Line to navigate to
+- `startLine' (optional): Start of range to highlight
+- `endLine' (optional): End of range to highlight (requires startLine)"
+  (let ((path (alist-get 'path arguments))
+        (line (alist-get 'line arguments))
+        (start-line (alist-get 'startLine arguments))
+        (end-line (alist-get 'endLine arguments)))
+    (unless path
+      (signal 'mcp-error '("Missing required parameter: path")))
+    (condition-case err
+        (let ((win (claude-code-ide-mcp--get-or-create-reference-window session)))
+          ;; Clear any existing highlight overlay
+          (let ((existing-ov (claude-code-ide-mcp-session-reference-overlay session)))
+            (when (overlayp existing-ov)
+              (delete-overlay existing-ov)))
+          (claude-code-ide-mcp-session-set-reference-overlay session nil)
+          (with-selected-window win
+            (find-file path)
+            (claude-code-ide-mcp--setup-buffer-cache-hooks)
+            (let ((target-line (or line start-line)))
+              (when target-line
+                (goto-char (point-min))
+                (forward-line (1- target-line))
+                (recenter 0)))
+            ;; Highlight the range with an overlay
+            (when (and start-line end-line)
+              (let* ((start-pos (save-excursion
+                                  (goto-char (point-min))
+                                  (forward-line (1- start-line))
+                                  (point)))
+                     (end-pos (save-excursion
+                                (goto-char (point-min))
+                                (forward-line (1- end-line))
+                                (end-of-line)
+                                (point)))
+                     (ov (make-overlay start-pos end-pos)))
+                (overlay-put ov 'face 'highlight)
+                (claude-code-ide-mcp-session-set-reference-overlay session ov))))
+          (list `((type . "text") (text . "REFERENCE_WINDOW_OPENED"))))
+      (error
+       (signal 'mcp-error (list (format "Failed to open reference window: %s"
+                                        (error-message-string err))))))))
+
+(defun claude-code-ide-mcp-handle-close-reference-window (_arguments session)
+  "Close the session-owned reference window and clean up its overlay."
+  (let ((ov (claude-code-ide-mcp-session-reference-overlay session))
+        (win (claude-code-ide-mcp-session-reference-window session)))
+    (when (overlayp ov)
+      (delete-overlay ov))
+    (claude-code-ide-mcp-session-set-reference-overlay session nil)
+    (when (and win (window-live-p win))
+      (delete-window win))
+    (claude-code-ide-mcp-session-set-reference-window session nil))
+  (list `((type . "text") (text . "REFERENCE_WINDOW_CLOSED"))))
+
 ;;; Tool Registry - Set the values
 
 (defun claude-code-ide-mcp--build-tool-list ()
@@ -755,7 +850,9 @@ ARGUMENTS should contain `filePath`."
     ,@(when (bound-and-true-p claude-code-ide-use-ide-diff)
         '(("openDiff" . claude-code-ide-mcp-handle-open-diff)
           ("closeAllDiffTabs" . claude-code-ide-mcp-handle-close-all-diff-tabs)))
-    ("checkDocumentDirty" . claude-code-ide-mcp-handle-check-document-dirty)))
+    ("checkDocumentDirty" . claude-code-ide-mcp-handle-check-document-dirty)
+    ("openReferenceWindow" . claude-code-ide-mcp-handle-open-reference-window)
+    ("closeReferenceWindow" . claude-code-ide-mcp-handle-close-reference-window)))
 
 (setq claude-code-ide-mcp-tools (claude-code-ide-mcp--build-tool-list))
 
@@ -809,7 +906,19 @@ ARGUMENTS should contain `filePath`."
     ("checkDocumentDirty" . ((type . "object")
                              (properties . ((filePath . ((type . "string")
                                                          (description . "Path to the file to check")))))
-                             (required . ["filePath"])))))
+                             (required . ["filePath"])))
+    ("openReferenceWindow" . ((type . "object")
+                              (properties . ((path . ((type . "string")
+                                                      (description . "Path to the file to open")))
+                                             (line . ((type . "integer")
+                                                      (description . "Line to navigate to")))
+                                             (startLine . ((type . "integer")
+                                                           (description . "Start line of range to highlight")))
+                                             (endLine . ((type . "integer")
+                                                         (description . "End line of range to highlight (requires startLine)")))))
+                              (required . ["path"])))
+    ("closeReferenceWindow" . ((type . "object")
+                               (properties . :json-empty)))))
 
 (setq claude-code-ide-mcp-tool-schemas (claude-code-ide-mcp--build-tool-schemas))
 
@@ -825,7 +934,9 @@ ARGUMENTS should contain `filePath`."
     ,@(when (bound-and-true-p claude-code-ide-use-ide-diff)
         '(("openDiff" . "Open a diff view comparing old and new file contents")
           ("closeAllDiffTabs" . "Close all open diff tabs in the current session")))
-    ("checkDocumentDirty" . "Check if a document has unsaved changes")))
+    ("checkDocumentDirty" . "Check if a document has unsaved changes")
+    ("openReferenceWindow" . "Open or update the agent's reference window on the main monitor, showing a file at an optional line with optional highlighted range. Creates the window on first call; subsequent calls reuse it.")
+    ("closeReferenceWindow" . "Close the agent's reference window on the main monitor")))
 
 (setq claude-code-ide-mcp-tool-descriptions (claude-code-ide-mcp--build-tool-descriptions))
 

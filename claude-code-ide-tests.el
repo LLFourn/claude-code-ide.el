@@ -1206,7 +1206,8 @@ have completed before cleanup.  Waits up to 5 seconds."
   ;; Build expected tools list dynamically based on configuration
   (let* ((base-tools '("openFile" "getCurrentSelection" "getOpenEditors"
                        "getWorkspaceFolders" "getDiagnostics" "saveDocument"
-                       "close_tab" "checkDocumentDirty"))
+                       "close_tab" "checkDocumentDirty"
+                       "openReferenceWindow" "closeReferenceWindow"))
          (diff-tools (when (bound-and-true-p claude-code-ide-use-ide-diff)
                        '("openDiff" "closeAllDiffTabs")))
          (expected-tools (append base-tools diff-tools)))
@@ -2274,6 +2275,193 @@ have completed before cleanup.  Waits up to 5 seconds."
           (should (not (plist-get file-path-arg :optional)))
           (should (equal (plist-get file-path-arg :description)
                          "Path to the file to analyze for symbols")))))))
+
+;;; Reference Window Tests
+
+(ert-deftest claude-code-ide-test-open-reference-window-basic ()
+  "Test that openReferenceWindow opens a file and returns REFERENCE_WINDOW_OPENED."
+  (claude-code-ide-mcp-tests--with-temp-file test-file "Line 1\nLine 2\nLine 3\nLine 4"
+    (let* ((session (make-claude-code-ide-mcp-session
+                     :project-dir default-directory))
+           (mock-window (selected-window)))
+      (cl-letf* (((symbol-function 'claude-code-ide-mcp--get-or-create-reference-window)
+                  (lambda (_s) mock-window))
+                 ((symbol-function 'claude-code-ide-mcp--setup-buffer-cache-hooks)
+                  (lambda () nil)))
+        (let ((result (claude-code-ide-mcp-handle-open-reference-window
+                       `((path . ,test-file)) session)))
+          (should (listp result))
+          (let ((first-item (car result)))
+            (should (equal (alist-get 'type first-item) "text"))
+            (should (equal (alist-get 'text first-item) "REFERENCE_WINDOW_OPENED")))
+          (kill-buffer (find-buffer-visiting test-file)))))))
+
+(ert-deftest claude-code-ide-test-open-reference-window-with-line ()
+  "Test that openReferenceWindow navigates to the specified line."
+  (claude-code-ide-mcp-tests--with-temp-file test-file "Line 1\nLine 2\nLine 3\nLine 4"
+    (let* ((session (make-claude-code-ide-mcp-session
+                     :project-dir default-directory))
+           (mock-window (selected-window)))
+      (cl-letf* (((symbol-function 'claude-code-ide-mcp--get-or-create-reference-window)
+                  (lambda (_s) mock-window))
+                 ((symbol-function 'claude-code-ide-mcp--setup-buffer-cache-hooks)
+                  (lambda () nil)))
+        (let ((result (claude-code-ide-mcp-handle-open-reference-window
+                       `((path . ,test-file) (line . 3)) session)))
+          (should (equal (alist-get 'text (car result)) "REFERENCE_WINDOW_OPENED"))
+          ;; The buffer should be visiting the test file
+          (let ((buf (find-buffer-visiting test-file)))
+            (should buf)
+            (kill-buffer buf)))))))
+
+(ert-deftest claude-code-ide-test-open-reference-window-with-range ()
+  "Test that openReferenceWindow creates a highlight overlay for a range."
+  (claude-code-ide-mcp-tests--with-temp-file test-file "Line 1\nLine 2\nLine 3\nLine 4"
+    (let* ((session (make-claude-code-ide-mcp-session
+                     :project-dir default-directory))
+           (mock-window (selected-window)))
+      (cl-letf* (((symbol-function 'claude-code-ide-mcp--get-or-create-reference-window)
+                  (lambda (_s) mock-window))
+                 ((symbol-function 'claude-code-ide-mcp--setup-buffer-cache-hooks)
+                  (lambda () nil)))
+        (let ((result (claude-code-ide-mcp-handle-open-reference-window
+                       `((path . ,test-file)
+                         (startLine . 2)
+                         (endLine . 3)) session)))
+          (should (equal (alist-get 'text (car result)) "REFERENCE_WINDOW_OPENED"))
+          ;; The session should have a highlight overlay stored
+          (let ((ov (claude-code-ide-mcp-session-reference-overlay session)))
+            (should (overlayp ov))
+            (delete-overlay ov))
+          (let ((buf (find-buffer-visiting test-file)))
+            (should buf)
+            (kill-buffer buf)))))))
+
+(ert-deftest claude-code-ide-test-open-reference-window-clears-previous-overlay ()
+  "Test that openReferenceWindow removes any existing overlay before creating a new one."
+  (claude-code-ide-mcp-tests--with-temp-file test-file "Line 1\nLine 2\nLine 3\nLine 4"
+    (let* ((session (make-claude-code-ide-mcp-session
+                     :project-dir default-directory))
+           (mock-window (selected-window))
+           ;; Pre-install a dummy overlay
+           (old-ov (with-current-buffer (get-buffer-create " *ref-win-test*")
+                     (make-overlay (point-min) (point-min)))))
+      (setf (claude-code-ide-mcp-session-reference-overlay session) old-ov)
+      (cl-letf* (((symbol-function 'claude-code-ide-mcp--get-or-create-reference-window)
+                  (lambda (_s) mock-window))
+                 ((symbol-function 'claude-code-ide-mcp--setup-buffer-cache-hooks)
+                  (lambda () nil)))
+        (claude-code-ide-mcp-handle-open-reference-window
+         `((path . ,test-file)) session)
+        ;; The old overlay should have been deleted
+        (should-not (overlay-buffer old-ov)))
+      (let ((buf (find-buffer-visiting test-file)))
+        (when buf (kill-buffer buf)))
+      (let ((scratch (get-buffer " *ref-win-test*")))
+        (when scratch (kill-buffer scratch))))))
+
+(ert-deftest claude-code-ide-test-open-reference-window-missing-path ()
+  "Test that openReferenceWindow signals mcp-error when path is missing."
+  (let ((session (make-claude-code-ide-mcp-session
+                  :project-dir default-directory)))
+    (should-error (claude-code-ide-mcp-handle-open-reference-window '() session)
+                  :type 'mcp-error)))
+
+(ert-deftest claude-code-ide-test-close-reference-window ()
+  "Test that closeReferenceWindow deletes the window and overlay, and returns REFERENCE_WINDOW_CLOSED."
+  (let* ((session (make-claude-code-ide-mcp-session
+                   :project-dir default-directory))
+         (window-deleted nil)
+         (overlay-deleted nil)
+         ;; Use a throw-away buffer for the overlay
+         (ov-buf (get-buffer-create " *ref-win-close-test*"))
+         (ov (with-current-buffer ov-buf
+               (make-overlay (point-min) (point-min)))))
+    (setf (claude-code-ide-mcp-session-reference-overlay session) ov)
+    ;; Use a sentinel symbol as the mock window
+    (let ((mock-window (cons 'mock-window nil)))
+      (setf (claude-code-ide-mcp-session-reference-window session) mock-window)
+      (cl-letf* (((symbol-function 'window-live-p)
+                  (lambda (w) (eq w mock-window)))
+                 ((symbol-function 'delete-window)
+                  (lambda (w)
+                    (when (eq w mock-window)
+                      (setq window-deleted t)))))
+        (let ((result (claude-code-ide-mcp-handle-close-reference-window nil session)))
+          (should (listp result))
+          (let ((first-item (car result)))
+            (should (equal (alist-get 'type first-item) "text"))
+            (should (equal (alist-get 'text first-item) "REFERENCE_WINDOW_CLOSED")))
+          ;; Overlay should be deleted
+          (should-not (overlay-buffer ov))
+          ;; Window should have been deleted
+          (should window-deleted)
+          ;; Session slots should be cleared
+          (should-not (claude-code-ide-mcp-session-reference-overlay session))
+          (should-not (claude-code-ide-mcp-session-reference-window session)))))
+    (when (buffer-live-p ov-buf) (kill-buffer ov-buf))))
+
+(ert-deftest claude-code-ide-test-close-reference-window-no-window ()
+  "Test that closeReferenceWindow succeeds even when no window or overlay is set."
+  (let ((session (make-claude-code-ide-mcp-session
+                  :project-dir default-directory)))
+    (let ((result (claude-code-ide-mcp-handle-close-reference-window nil session)))
+      (should (equal (alist-get 'text (car result)) "REFERENCE_WINDOW_CLOSED")))))
+
+(ert-deftest claude-code-ide-test-get-or-create-reference-window-reuses-window ()
+  "Test that get-or-create-reference-window reuses an existing live window."
+  (let* ((session (make-claude-code-ide-mcp-session
+                   :project-dir default-directory))
+         (split-count 0)
+         (mock-window (cons 'mock-window nil)))
+    (cl-letf* (((symbol-function 'claude-code-ide-mcp--get-main-frame)
+                (lambda (_s) (selected-frame)))
+               ((symbol-function 'claude-code-ide-mcp--rightmost-editing-window)
+                (lambda (_f) (selected-window)))
+               ((symbol-function 'split-window)
+                (lambda (&rest _args)
+                  (setq split-count (1+ split-count))
+                  mock-window))
+               ((symbol-function 'window-live-p)
+                (lambda (w) (eq w mock-window))))
+      ;; First call should create the window via split-window
+      (let ((win1 (claude-code-ide-mcp--get-or-create-reference-window session)))
+        (should (eq win1 mock-window))
+        (should (= split-count 1)))
+      ;; Second call should reuse the existing window without splitting
+      (let ((win2 (claude-code-ide-mcp--get-or-create-reference-window session)))
+        (should (eq win2 mock-window))
+        (should (= split-count 1))))))
+
+(ert-deftest claude-code-ide-test-reference-window-teardown-cleanup ()
+  "Test that session teardown cleans up the reference window and overlay."
+  (let* ((session (make-claude-code-ide-mcp-session
+                   :project-dir default-directory))
+         (window-deleted nil)
+         (ov-buf (get-buffer-create " *ref-win-teardown-test*"))
+         (ov (with-current-buffer ov-buf
+               (make-overlay (point-min) (point-min))))
+         (mock-window (cons 'mock-window nil)))
+    (setf (claude-code-ide-mcp-session-reference-overlay session) ov)
+    (setf (claude-code-ide-mcp-session-reference-window session) mock-window)
+    ;; Simulate the teardown cleanup block from claude-code-ide-mcp-stop-session
+    (cl-letf* (((symbol-function 'window-live-p)
+                (lambda (w) (eq w mock-window)))
+               ((symbol-function 'delete-window)
+                (lambda (w)
+                  (when (eq w mock-window)
+                    (setq window-deleted t)))))
+      (let ((ref-ov (claude-code-ide-mcp-session-reference-overlay session))
+            (ref-win (claude-code-ide-mcp-session-reference-window session)))
+        (when (overlayp ref-ov)
+          (delete-overlay ref-ov))
+        (when (and ref-win (window-live-p ref-win))
+          (ignore-errors (delete-window ref-win))))
+      ;; Overlay should be deleted
+      (should-not (overlay-buffer ov))
+      ;; Window should have been deleted
+      (should window-deleted))
+    (when (buffer-live-p ov-buf) (kill-buffer ov-buf))))
 
 (provide 'claude-code-ide-tests)
 

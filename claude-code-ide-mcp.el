@@ -51,7 +51,6 @@
 (require 'project)
 (require 'url-parse)
 (require 'claude-code-ide-debug)
-(require 'claude-code-ide-mcp-handlers)
 (require 'claude-code-ide-mcp-server)
 
 ;; External declarations
@@ -116,8 +115,24 @@ Set to nil when cache needs to be invalidated.")
   selection-timer  ; Selection tracking timer
   last-selection   ; Last selection state
   last-buffer      ; Last active buffer
-  active-diffs     ; Hash table of active diffs
-  original-tab)    ; Original tab-bar tab where Claude was opened
+  active-diffs       ; Hash table of active diffs
+  original-tab       ; Original tab-bar tab where Claude was opened
+  reference-window   ; Window owned by this session for showing reference files
+  reference-overlay) ; Highlight overlay in the reference window
+
+;; Setter functions for reference-window fields.
+;; handlers.el can't require this file (circular dep) so it can't use setf
+;; on struct slots directly (eager macro expansion needs the gv-expander).
+(defun claude-code-ide-mcp-session-set-reference-window (session val)
+  "Set the reference window for SESSION to VAL."
+  (setf (claude-code-ide-mcp-session-reference-window session) val))
+
+(defun claude-code-ide-mcp-session-set-reference-overlay (session val)
+  "Set the reference overlay for SESSION to VAL."
+  (setf (claude-code-ide-mcp-session-reference-overlay session) val))
+
+;; Load handlers after struct definition so setf forms expand correctly
+(require 'claude-code-ide-mcp-handlers)
 
 (defun claude-code-ide-mcp--get-buffer-project ()
   "Get the project directory for the current buffer.
@@ -346,7 +361,9 @@ Optional SESSION contains the MCP session context."
         (condition-case err
             (progn
               (claude-code-ide-debug "Found handler for tool: %s" tool-name)
-              (let ((result (if (member tool-name '("getDiagnostics"))
+              (let ((result (if (member tool-name '("getDiagnostics"
+                                                    "openReferenceWindow"
+                                                    "closeReferenceWindow"))
                                 ;; Pass session to handlers that need it
                                 (funcall handler arguments session)
                               (funcall handler arguments))))
@@ -868,6 +885,14 @@ This should be called when the buffer's context might have changed."
     (when-let ((port (claude-code-ide-mcp-session-port session)))
       (claude-code-ide-debug "Removing lockfile for port %d" port)
       (claude-code-ide-mcp--remove-lockfile port))
+
+    ;; Clean up reference window and overlay
+    (let ((ref-ov (claude-code-ide-mcp-session-reference-overlay session))
+          (ref-win (claude-code-ide-mcp-session-reference-window session)))
+      (when (overlayp ref-ov)
+        (delete-overlay ref-ov))
+      (when (and ref-win (window-live-p ref-win))
+        (ignore-errors (delete-window ref-win))))
 
     ;; Remove session from registry
     (remhash project-dir claude-code-ide-mcp--sessions)

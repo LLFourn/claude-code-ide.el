@@ -621,6 +621,26 @@ If DIRECTORY is not provided, use the current working directory."
 ;; Ensure cleanup on Emacs exit
 (add-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions)
 
+(defun claude-code-ide--find-available-secondary-frame ()
+  "Find a secondary monitor frame (monitor-2 or monitor-3) without a Claude session.
+Returns the frame, or nil if none available."
+  (let ((secondary-frames
+         (cl-remove-if-not
+          (lambda (f)
+            (and (frame-parameter f 'my-monitor-frame)
+                 (> (frame-parameter f 'my-monitor-frame) 1)))
+          (frame-list))))
+    ;; Prefer a frame that doesn't already have a claude-code buffer displayed
+    (or (cl-find-if
+         (lambda (f)
+           (not (cl-some (lambda (w)
+                           (string-match-p "\\*claude-code"
+                                           (buffer-name (window-buffer w))))
+                         (window-list f))))
+         secondary-frames)
+        ;; Fall back to any secondary frame
+        (car secondary-frames))))
+
 (defun claude-code-ide--display-buffer-in-side-window (buffer)
   "Display BUFFER in a side window according to customization.
 The window is displayed on the side specified by
@@ -628,23 +648,19 @@ The window is displayed on the side specified by
 `claude-code-ide-window-width' or `claude-code-ide-window-height'.
 If `claude-code-ide-focus-on-open' is non-nil, the window is selected.
 
-If a frame with title \"emacs-monitor-2\" exists, the buffer will be
-displayed fullscreen in that frame instead."
-  (let* ((monitor-2-frame (cl-find-if
-                           (lambda (f)
-                             (equal (frame-parameter f 'title) "emacs-monitor-2"))
-                           (frame-list)))
+If secondary monitor frames exist, the buffer will be displayed
+fullscreen in one that doesn't already have a Claude session."
+  (let* ((target-frame (claude-code-ide--find-available-secondary-frame))
          (window
-          (if monitor-2-frame
-              ;; Display in monitor-2 frame fullscreen using proper display-buffer
+          (if target-frame
+              ;; Display in the target secondary frame fullscreen
               (display-buffer buffer
                               `((display-buffer-use-some-frame
                                  display-buffer-full-frame)
                                 (frame-predicate . ,(lambda (frame)
-                                                      (equal (frame-parameter frame 'title)
-                                                             "emacs-monitor-2")))
+                                                      (eq frame target-frame)))
                                 (inhibit-switch-frame . ,(not claude-code-ide-focus-on-open))))
-            ;; No monitor-2 frame, use normal behavior
+            ;; No secondary frame, use normal behavior
             (if claude-code-ide-use-side-window
                 ;; Use side window
                 (let* ((side claude-code-ide-window-side)
@@ -665,8 +681,8 @@ displayed fullscreen in that frame instead."
               (display-buffer buffer)))))
     ;; Update last accessed buffer whenever we display a Claude buffer
     (setq claude-code-ide--last-accessed-buffer buffer)
-    ;; For monitor-2-frame, display-buffer already handled focus based on inhibit-switch-frame
-    (when (and window claude-code-ide-focus-on-open (not monitor-2-frame))
+    ;; For target-frame, display-buffer already handled focus based on inhibit-switch-frame
+    (when (and window claude-code-ide-focus-on-open (not target-frame))
       (select-window window))
     ;; For bottom/top windows, explicitly set and preserve the height
     (when (and window
@@ -872,7 +888,8 @@ Signals an error if terminal fails to initialize."
          (env-vars (list (format "CLAUDE_CODE_SSE_PORT=%d" port)
                          "ENABLE_IDE_INTEGRATION=true"
                          "TERM_PROGRAM=emacs"
-                         "FORCE_CODE_TERMINAL=true")))
+                         "FORCE_CODE_TERMINAL=true"
+                         (format "COLUMNS=%d" (window-body-width)))))
     ;; Log the command for debugging
     (claude-code-ide-debug "Starting Claude with command: %s" claude-cmd)
     (claude-code-ide-debug "Working directory: %s" working-dir)
@@ -1175,25 +1192,48 @@ Use this to balance between visual smoothness and raw responsiveness."
 
 ;;;###autoload
 (defun claude-code-ide-force-resize ()
-  "Force the current vterm buffer to resize to the current window dimensions.
-This works by toggling fullscreen off and back on, giving the window system
-time to fully redraw in each state, which triggers Claude Code to re-detect
-the terminal size."
+  "Force Claude Code to re-detect terminal dimensions.
+Directly sets the PTY size and sends SIGWINCH to the child process,
+then nudges vterm's internal state to match."
   (interactive)
   (if (eq claude-code-ide-terminal-backend 'vterm)
       (if (and (boundp 'vterm--process)
                vterm--process
                (process-live-p vterm--process))
-          (let ((frame (selected-frame)))
-            (message "Forcing vterm resize by toggling fullscreen off...")
-            ;; Toggle fullscreen OFF
-            (toggle-frame-fullscreen frame)
-            (sit-for 1.0)  ; Wait for the toggle to complete and redraw
-            (message "Toggling fullscreen back on...")
-            ;; Toggle fullscreen back ON
-            (toggle-frame-fullscreen frame)
-            (sit-for 1.0)  ; Wait for the toggle to complete and redraw
-            (message "Vterm resize complete"))
+          (let* ((win (get-buffer-window (current-buffer)))
+                 (width (- (window-body-width win)
+                           (if (bound-and-true-p display-line-numbers-mode)
+                               (vterm--get-margin-width) 0)))
+                 (height (window-body-height win))
+                 (buf (current-buffer)))
+            (let ((inhibit-read-only t))
+              ;; 1. Update libvterm's internal terminal size
+              (vterm--set-size vterm--term height width)
+              ;; 2. Set PTY size (sends TIOCSWINSZ ioctl + SIGWINCH)
+              (set-process-window-size vterm--process height width))
+            ;; 3. Nudge with a slightly different size then back to force
+            ;;    Claude Code's ink to re-read process.stdout.columns
+            (run-with-timer 0.1 nil
+                            (lambda ()
+                              (when (buffer-live-p buf)
+                                (with-current-buffer buf
+                                  (when (and (boundp 'vterm--process)
+                                             vterm--process
+                                             (process-live-p vterm--process))
+                                    (let ((inhibit-read-only t))
+                                      (set-process-window-size vterm--process height (1- width))
+                                      (vterm--set-size vterm--term height (1- width)))
+                                    (run-with-timer 0.1 nil
+                                                    (lambda ()
+                                                      (when (buffer-live-p buf)
+                                                        (with-current-buffer buf
+                                                          (when (and (boundp 'vterm--process)
+                                                                     vterm--process
+                                                                     (process-live-p vterm--process))
+                                                            (let ((inhibit-read-only t))
+                                                              (set-process-window-size vterm--process height width)
+                                                              (vterm--set-size vterm--term height width))))))))))))
+            (message "Forced resize to %dx%d" width height))
         (user-error "No live vterm process in current buffer"))
     (user-error "Not using vterm backend")))
 
@@ -1261,18 +1301,15 @@ If no Claude windows are visible, show the most recently accessed one."
       (user-error "No recent Claude Code session to toggle")))))
 
 (defun claude-code-ide--auto-switch-on-project-change ()
-  "Automatically switch to or resume Claude session on monitor-2 when changing projects.
+  "Automatically switch to or resume Claude session on a secondary monitor when changing projects.
 This function is designed to be called from projectile hooks and will not
 steal focus from the current frame."
   (when (and (boundp 'projectile-mode)
              projectile-mode
              (projectile-project-p))
-    (let* ((monitor-2-frame (cl-find-if
-                             (lambda (f)
-                               (equal (frame-parameter f 'title) "emacs-monitor-2"))
-                             (frame-list)))
+    (let* ((target-frame (claude-code-ide--find-available-secondary-frame))
            (current-frame (selected-frame)))
-      (if monitor-2-frame
+      (if target-frame
           (progn
             (let* ((working-dir (claude-code-ide--get-working-directory))
                    (buffer-name (claude-code-ide--get-buffer-name))
@@ -1281,11 +1318,11 @@ steal focus from the current frame."
               (if (and existing-buffer
                        (buffer-live-p existing-buffer)
                        existing-process)
-                  ;; Session exists, display it on monitor-2 without focus
-                  (with-selected-frame monitor-2-frame
+                  ;; Session exists, display it on target frame without focus
+                  (with-selected-frame target-frame
                     (switch-to-buffer existing-buffer)
                     (delete-other-windows))
-                ;; No session, start one with continue flag on monitor-2
+                ;; No session, start one with continue flag on target frame
                 (when (claude-code-ide--ensure-cli)
                   (claude-code-ide--cleanup-dead-processes)
                   (claude-code-ide--terminal-ensure-backend)
@@ -1330,8 +1367,8 @@ steal focus from the current frame."
                                           nil t))
                                ((eq claude-code-ide-terminal-backend 'eat)
                                 nil)))
-                            ;; Display on monitor-2 without focus
-                            (with-selected-frame monitor-2-frame
+                            ;; Display on target frame without focus
+                            (with-selected-frame target-frame
                               (switch-to-buffer buffer)
                               (delete-other-windows))))
                       (error
