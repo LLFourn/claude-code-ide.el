@@ -90,16 +90,19 @@
 
 ;;; Customization
 
+;;;###autoload
 (defgroup claude-code-ide nil
   "Claude Code integration for Emacs."
   :group 'tools
   :prefix "claude-code-ide-")
 
+;;;###autoload
 (defcustom claude-code-ide-cli-path "claude"
   "Path to the Claude Code CLI executable."
   :type 'string
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-provider 'claude
   "AI coding assistant to run.
 Set this to `claude' or `codex' at runtime to choose which CLI the
@@ -108,11 +111,13 @@ Set this to `claude' or `codex' at runtime to choose which CLI the
                  (const :tag "Codex" codex))
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-codex-cli-path "codex"
   "Path to the Codex CLI executable."
   :type 'string
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-buffer-name-function #'claude-code-ide--default-buffer-name
   "Function to generate buffer names for Claude Code sessions.
 The function is called with one argument, the working directory,
@@ -120,23 +125,27 @@ and should return a string to use as the buffer name."
   :type 'function
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-cli-debug nil
   "When non-nil, launch Claude Code with the -d debug flag."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-cli-extra-flags ""
   "Additional flags to pass to the Claude Code CLI.
 This should be a string of space-separated flags, e.g. \"--model opus\"."
   :type 'string
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-codex-cli-extra-flags ""
   "Additional flags to pass to the Codex CLI.
 This should be a string of space-separated flags, e.g. \"--model gpt-5.4\"."
   :type 'string
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-system-prompt nil
   "System prompt to append to Claude's default system prompt.
 When non-nil, the --append-system-prompt flag will be added with this value.
@@ -145,6 +154,7 @@ Set to nil to disable (default)."
                  (string :tag "System prompt text"))
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-mcp-allowed-tools 'auto
   "Configuration for allowed MCP tools when MCP server is enabled.
 Can be one of:
@@ -158,6 +168,7 @@ Can be one of:
                  (repeat :tag "Specific tools" string))
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-window-side 'right
   "Side of the frame where the Claude Code window should appear.
 Can be `'left', `'right', `'top', or `'bottom'."
@@ -167,21 +178,25 @@ Can be `'left', `'right', `'top', or `'bottom'."
                  (const :tag "Bottom" bottom))
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-window-width 90
   "Width of the Claude Code side window when opened on left or right."
   :type 'integer
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-window-height 20
   "Height of the Claude Code side window when opened on top or bottom."
   :type 'integer
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-focus-on-open t
   "Whether to focus the Claude Code window when it opens."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-focus-claude-after-ediff t
   "Whether to focus the Claude Code window after opening ediff.
 When non-nil (default), focus returns to the Claude Code window
@@ -190,6 +205,7 @@ window, allowing direct interaction with the diff controls."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-show-claude-window-in-ediff t
   "Whether to show the Claude Code side window when viewing diffs.
 When non-nil (default), the Claude Code side window is restored
@@ -199,6 +215,7 @@ diff comparison."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-use-ide-diff t
   "Whether to use IDE diff viewer for file differences.
 When non-nil (default), Claude Code will open an IDE diff viewer
@@ -207,6 +224,7 @@ display diffs in the terminal instead."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-switch-tab-on-ediff t
   "Whether to switch back to Claude's original tab when opening ediff.
 When non-nil (default), Claude Code will switch back to the tab
@@ -215,6 +233,7 @@ When nil, the current tab remains active when ediff is opened."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-use-side-window t
   "Whether to display Claude Code in a side window.
 When non-nil (default), Claude Code opens in a dedicated side window
@@ -224,6 +243,7 @@ display-buffer behavior."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-terminal-backend 'vterm
   "Terminal backend to use for Claude Code sessions.
 Can be either `vterm' or `eat'.  The vterm backend is the default
@@ -234,6 +254,7 @@ environments."
                  (const :tag "eat" eat))
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-prevent-reflow-glitch t
   "Workaround for Claude Code terminal scrolling bug #1422.
 When non-nil (default), prevents the terminal from reflowing on height-only
@@ -243,6 +264,7 @@ This setting should be removed once the upstream bug is fixed."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-vterm-anti-flicker t
   "Enable intelligent flicker reduction for vterm display.
 When enabled, this feature optimizes terminal rendering by detecting
@@ -255,6 +277,7 @@ matching to maintain responsiveness while improving visual quality."
   :type 'boolean
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-vterm-render-delay 0.005
   "Rendering optimization delay for batched terminal updates.
 This parameter defines the collection window for related terminal
@@ -266,6 +289,7 @@ with imperceptible latency."
   :type 'number
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-terminal-initialization-delay 0.1
   "Initialization delay for terminal stability.
 Provides a brief stabilization period when launching terminals
@@ -278,6 +302,7 @@ without noticeable latency."
   :type 'number
   :group 'claude-code-ide)
 
+;;;###autoload
 (defcustom claude-code-ide-eat-preserve-position t
   "Maintain terminal scroll position when switching windows.
 When enabled, prevents the eat terminal from jumping to the top
