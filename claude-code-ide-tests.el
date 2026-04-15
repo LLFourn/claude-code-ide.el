@@ -231,6 +231,12 @@ have completed before cleanup.  Waits up to 5 seconds."
   (should (equal (claude-code-ide--default-buffer-name "/home/user/my-project@v1.0/")
                  "*claude-code[my-project@v1.0]*")))
 
+(ert-deftest claude-code-ide-test-default-buffer-name-codex ()
+  "Test Codex buffer name generation."
+  (let ((claude-code-ide-provider 'codex))
+    (should (equal (claude-code-ide--default-buffer-name "/home/user/project")
+                   "*codex[project]*"))))
+
 (ert-deftest claude-code-ide-test-get-working-directory ()
   "Test working directory detection."
   (claude-code-ide-tests--with-temp-directory
@@ -441,7 +447,7 @@ have completed before cleanup.  Waits up to 5 seconds."
                  (setq prompted-string prompt)
                  test-prompt))
               ((symbol-function 'claude-code-ide--get-buffer-name)
-               (lambda () "*test-claude-buffer*"))
+               (lambda (&rest _) "*test-claude-buffer*"))
               ((symbol-function 'claude-code-ide--terminal-send-string)
                (lambda (str) (setq sent-string str)))
               ((symbol-function 'claude-code-ide--terminal-send-return)
@@ -451,7 +457,7 @@ have completed before cleanup.  Waits up to 5 seconds."
       (with-temp-buffer
         (rename-buffer "*test-claude-buffer*")
         (claude-code-ide-send-prompt)
-        (should (equal prompted-string "Claude prompt: "))
+        (should (equal prompted-string "Claude Code prompt: "))
         (should (equal sent-string test-prompt))
         (should sent-return))
 
@@ -907,6 +913,41 @@ have completed before cleanup.  Waits up to 5 seconds."
                   (string-match-p "Connected\\\\ to\\\\ Emacs" cmd)))
       ;; The command should contain the escaped version (shell-quote-argument escapes quotes and apostrophes)
       (should (string-match-p "You\\\\'re\\\\ a\\\\ \\\\\"helpful\\\\\"\\\\ assistant\\\\!" cmd)))))
+
+(ert-deftest claude-code-ide-test-build-codex-command ()
+  "Test building Codex commands for start, continue, and resume."
+  (let ((claude-code-ide-codex-cli-path "codex")
+        (claude-code-ide-codex-cli-extra-flags "--model gpt-5.4")
+        (claude-code-ide-system-prompt "You are a helpful assistant"))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+               (lambda () nil)))
+      (let ((cmd (claude-code-ide--build-codex-command nil nil "test-session" "/tmp/project")))
+        (let ((unescaped-cmd (replace-regexp-in-string "\\\\" "" cmd)))
+          (should (string-prefix-p "codex " cmd))
+          (should (string-match-p (regexp-quote "-C /tmp/project") cmd))
+          (should (string-match-p "developer_instructions" cmd))
+          (should (string-match-p "Connected to Emacs" unescaped-cmd))
+          (should (string-match-p "You are a helpful assistant" unescaped-cmd))
+          (should (string-match-p (regexp-quote "--model gpt-5.4") cmd))))
+      (let ((cmd (claude-code-ide--build-codex-command t nil "test-session" "/tmp/project")))
+        (should (string-match-p (regexp-quote "codex resume --last") cmd)))
+      (let ((cmd (claude-code-ide--build-codex-command nil t "test-session" "/tmp/project")))
+        (should (string-match-p (regexp-quote "codex resume") cmd))
+        (should-not (string-match-p (regexp-quote "--last") cmd))))))
+
+(ert-deftest claude-code-ide-test-build-codex-command-with-mcp ()
+  "Test Codex command construction includes HTTP MCP config."
+  (let ((claude-code-ide-codex-cli-path "codex")
+        (claude-code-ide-codex-cli-extra-flags "")
+        (claude-code-ide-system-prompt nil))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+               (lambda () 7777))
+              ((symbol-function 'claude-code-ide-mcp-server-get-port)
+               (lambda () 7777)))
+      (let ((cmd (claude-code-ide--build-codex-command nil nil "test-session" "/tmp/project")))
+        (let ((unescaped-cmd (replace-regexp-in-string "\\\\" "" cmd)))
+          (should (string-match-p "mcp_servers.emacs-tools.url" cmd))
+          (should (string-match-p "http://localhost:7777/mcp/test-session" unescaped-cmd)))))))
 
 (ert-deftest claude-code-ide-test-error-handling ()
   "Test error handling in various scenarios."

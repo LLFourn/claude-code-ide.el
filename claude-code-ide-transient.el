@@ -43,7 +43,12 @@
 (declare-function claude-code-ide-insert-newline "claude-code-ide" ())
 (declare-function claude-code-ide-toggle "claude-code-ide" ())
 (declare-function claude-code-ide-check-status "claude-code-ide" ())
-(declare-function claude-code-ide--ensure-cli "claude-code-ide" ())
+(declare-function claude-code-ide--ensure-cli "claude-code-ide" (&optional provider))
+(declare-function claude-code-ide--detect-cli "claude-code-ide" (&optional provider))
+(declare-function claude-code-ide--normalize-provider "claude-code-ide" (&optional provider))
+(declare-function claude-code-ide--provider-display-name "claude-code-ide" (&optional provider))
+(declare-function claude-code-ide--provider-cli-path "claude-code-ide" (&optional provider))
+(declare-function claude-code-ide--get-process "claude-code-ide" (&optional directory provider))
 (declare-function claude-code-ide-mcp--active-sessions "claude-code-ide-mcp" ())
 (declare-function claude-code-ide-mcp-session-project-dir "claude-code-ide-mcp" (session))
 (declare-function claude-code-ide-mcp-session-port "claude-code-ide-mcp" (session))
@@ -55,6 +60,8 @@
 
 ;; Declare variables
 (defvar claude-code-ide-cli-path)
+(defvar claude-code-ide-codex-cli-path)
+(defvar claude-code-ide-provider)
 (defvar claude-code-ide-debug)
 (defvar claude-code-ide-window-side)
 (defvar claude-code-ide-window-width)
@@ -67,27 +74,31 @@
 (defvar claude-code-ide-use-side-window)
 (defvar claude-code-ide-cli-debug)
 (defvar claude-code-ide-cli-extra-flags)
+(defvar claude-code-ide-codex-cli-extra-flags)
 (defvar claude-code-ide-system-prompt)
+(defvar claude-code-ide--cli-availability)
 
 ;;; Helper Functions
 
 (defun claude-code-ide--has-active-session-p ()
-  "Check if there's an active Claude Code session for the current buffer."
-  (when (claude-code-ide-mcp--get-current-session) t))
+  "Check if there's an active assistant session for the current buffer."
+  (or (when-let ((process (claude-code-ide--get-process)))
+        (process-live-p process))
+      (when (claude-code-ide-mcp--get-current-session) t)))
 
 (defun claude-code-ide--start-description ()
   "Dynamic description for start command based on session status."
   (if (claude-code-ide--has-active-session-p)
-      (propertize "Start new Claude Code session (session already running)"
+      (propertize "Start new assistant session (session already running)"
                   'face 'transient-inactive-value)
-    "Start new Claude Code session"))
+    (format "Start new %s session" (claude-code-ide--provider-display-name))))
 
 (defun claude-code-ide--start-if-no-session ()
   "Start Claude Code only if no session is active for current buffer."
   (interactive)
   (if (claude-code-ide--has-active-session-p)
       (let ((working-dir (claude-code-ide--get-working-directory)))
-        (claude-code-ide-log "Claude Code session already running in %s"
+        (claude-code-ide-log "Assistant session already running in %s"
                              (abbreviate-file-name working-dir)))
     (claude-code-ide)))
 
@@ -103,7 +114,7 @@
   (interactive)
   (if (claude-code-ide--has-active-session-p)
       (let ((working-dir (claude-code-ide--get-working-directory)))
-        (claude-code-ide-log "Claude Code session already running in %s"
+        (claude-code-ide-log "Assistant session already running in %s"
                              (abbreviate-file-name working-dir)))
     (claude-code-ide-continue)))
 
@@ -119,7 +130,7 @@
   (interactive)
   (if (claude-code-ide--has-active-session-p)
       (let ((working-dir (claude-code-ide--get-working-directory)))
-        (claude-code-ide-log "Claude Code session already running in %s"
+        (claude-code-ide-log "Assistant session already running in %s"
                              (abbreviate-file-name working-dir)))
     (claude-code-ide-resume)))
 
@@ -141,20 +152,23 @@ Otherwise, if multiple sessions exist, prompt for selection."
   (claude-code-ide-toggle))
 
 (defun claude-code-ide-show-version-info ()
-  "Show detailed version information for Claude Code CLI."
+  "Show detailed version information for the configured assistant CLI."
   (interactive)
-  (if (claude-code-ide--ensure-cli)
-      (let ((version-output
-             (with-temp-buffer
-               (call-process claude-code-ide-cli-path nil t nil "--version")
-               (buffer-string))))
-        (with-output-to-temp-buffer "*Claude Code Version*"
-          (princ "Claude Code CLI Version Information\n")
-          (princ "===================================\n\n")
-          (princ version-output)
-          (princ "\n\nExecutable path: ")
-          (princ (executable-find claude-code-ide-cli-path))))
-    (user-error "Claude Code CLI not available")))
+  (let* ((provider (claude-code-ide--normalize-provider))
+         (assistant-name (claude-code-ide--provider-display-name provider))
+         (cli-path (claude-code-ide--provider-cli-path provider)))
+    (if (claude-code-ide--ensure-cli provider)
+        (let ((version-output
+               (with-temp-buffer
+                 (call-process cli-path nil t nil "--version")
+                 (buffer-string))))
+          (with-output-to-temp-buffer (format "*%s Version*" assistant-name)
+            (princ (format "%s CLI Version Information\n" assistant-name))
+            (princ "===================================\n\n")
+            (princ version-output)
+            (princ "\n\nExecutable path: ")
+            (princ (executable-find cli-path))))
+      (user-error "%s CLI not available" assistant-name))))
 
 (defun claude-code-ide-show-mcp-sessions ()
   "Show information about active MCP sessions."
@@ -225,16 +239,42 @@ Otherwise, if multiple sessions exist, prompt for selection."
 (transient-define-suffix claude-code-ide--set-cli-path (path)
   "Set CLI path."
   :description "Set CLI path"
-  (interactive (list (read-file-name "Claude CLI path: " nil claude-code-ide-cli-path t)))
-  (setq claude-code-ide-cli-path path)
+  (interactive
+   (let* ((provider (claude-code-ide--normalize-provider))
+          (assistant-name (claude-code-ide--provider-display-name provider))
+          (current-path (claude-code-ide--provider-cli-path provider)))
+     (list (read-file-name (format "%s CLI path: " assistant-name)
+                           nil current-path t))))
+  (pcase (claude-code-ide--normalize-provider)
+    ('codex (setq claude-code-ide-codex-cli-path path))
+    (_ (setq claude-code-ide-cli-path path)))
+  (clrhash claude-code-ide--cli-availability)
   (claude-code-ide-log "CLI path set to %s" path))
 
 (transient-define-suffix claude-code-ide--set-cli-extra-flags (flags)
   "Set additional CLI flags."
   :description "Set additional CLI flags"
-  (interactive (list (read-string "Additional CLI flags: " claude-code-ide-cli-extra-flags)))
-  (setq claude-code-ide-cli-extra-flags flags)
+  (interactive
+   (list (read-string "Additional CLI flags: "
+                      (if (eq (claude-code-ide--normalize-provider) 'codex)
+                          claude-code-ide-codex-cli-extra-flags
+                        claude-code-ide-cli-extra-flags))))
+  (pcase (claude-code-ide--normalize-provider)
+    ('codex (setq claude-code-ide-codex-cli-extra-flags flags))
+    (_ (setq claude-code-ide-cli-extra-flags flags)))
   (claude-code-ide-log "CLI extra flags set to %s" flags))
+
+(transient-define-suffix claude-code-ide--set-provider (provider)
+  "Set active assistant provider."
+  :description "Set assistant"
+  (interactive
+   (list (intern (completing-read "Assistant: "
+                                  '("codex" "claude")
+                                  nil t nil nil
+                                  (symbol-name claude-code-ide-provider)))))
+  (setq claude-code-ide-provider provider)
+  (claude-code-ide-log "Assistant set to %s"
+                       (claude-code-ide--provider-display-name provider)))
 
 (transient-define-suffix claude-code-ide--set-system-prompt (prompt)
   "Set the system prompt to append."
@@ -305,8 +345,11 @@ Otherwise, if multiple sessions exist, prompt for selection."
   (customize-save-variable 'claude-code-ide-use-ide-diff claude-code-ide-use-ide-diff)
   (customize-save-variable 'claude-code-ide-switch-tab-on-ediff claude-code-ide-switch-tab-on-ediff)
   (customize-save-variable 'claude-code-ide-use-side-window claude-code-ide-use-side-window)
+  (customize-save-variable 'claude-code-ide-provider claude-code-ide-provider)
   (customize-save-variable 'claude-code-ide-cli-path claude-code-ide-cli-path)
+  (customize-save-variable 'claude-code-ide-codex-cli-path claude-code-ide-codex-cli-path)
   (customize-save-variable 'claude-code-ide-cli-extra-flags claude-code-ide-cli-extra-flags)
+  (customize-save-variable 'claude-code-ide-codex-cli-extra-flags claude-code-ide-codex-cli-extra-flags)
   (customize-save-variable 'claude-code-ide-system-prompt claude-code-ide-system-prompt)
   (claude-code-ide-log "Configuration saved to custom file"))
 
@@ -314,9 +357,9 @@ Otherwise, if multiple sessions exist, prompt for selection."
 
 ;;;###autoload (autoload 'claude-code-ide-menu "claude-code-ide-transient" "Claude Code IDE main menu." t)
 (transient-define-prefix claude-code-ide-menu ()
-  "Claude Code IDE main menu."
+  "Assistant IDE main menu."
   [:description claude-code-ide--session-status]
-  ["Claude Code IDE"
+  ["Assistant IDE"
    ["Session Management"
     ("s" claude-code-ide--start-if-no-session :description claude-code-ide--start-description)
     ("c" claude-code-ide--continue-if-no-session :description claude-code-ide--continue-description)
@@ -324,7 +367,7 @@ Otherwise, if multiple sessions exist, prompt for selection."
     ("q" "Stop current session" claude-code-ide-stop)
     ("l" "List all sessions" claude-code-ide-list-sessions)]
    ["Navigation"
-    ("b" "Switch to Claude buffer" claude-code-ide-switch-to-buffer)
+    ("b" "Switch to assistant buffer" claude-code-ide-switch-to-buffer)
     ("w" "Toggle window visibility" claude-code-ide-toggle-window)
     ("W" "Toggle recent window" claude-code-ide-toggle-recent)]
    ["Interaction"
@@ -337,8 +380,8 @@ Otherwise, if multiple sessions exist, prompt for selection."
     ("d" "Debugging" claude-code-ide-debug-menu)]])
 
 (transient-define-prefix claude-code-ide-config-menu ()
-  "Claude Code configuration menu."
-  ["Claude Code Configuration"
+  "Assistant configuration menu."
+  ["Assistant Configuration"
    ["Window Settings"
     ("s" "Set window side" claude-code-ide--set-window-side)
     ("w" "Set window width" claude-code-ide--set-window-width)
@@ -362,6 +405,9 @@ Otherwise, if multiple sessions exist, prompt for selection."
      :description (lambda () (format "Use side window (%s)"
                                      (if claude-code-ide-use-side-window "ON" "OFF"))))]
    ["CLI Settings"
+    ("A" "Set assistant" claude-code-ide--set-provider
+     :description (lambda () (format "Assistant (%s)"
+                                     (claude-code-ide--provider-display-name))))
     ("p" "Set CLI path" claude-code-ide--set-cli-path)
     ("x" "Set extra CLI flags" claude-code-ide--set-cli-extra-flags)
     ("a" "Set system prompt" claude-code-ide--set-system-prompt)]]
@@ -369,8 +415,8 @@ Otherwise, if multiple sessions exist, prompt for selection."
    ("S" "Save configuration" claude-code-ide--save-config)])
 
 (transient-define-prefix claude-code-ide-debug-menu ()
-  "Claude Code debug menu."
-  ["Claude Code Debug"
+  "Assistant debug menu."
+  ["Assistant Debug"
    ["Status"
     ("S" "Check CLI status" claude-code-ide-check-status)
     ("v" "Show version info" claude-code-ide-show-version-info)]
