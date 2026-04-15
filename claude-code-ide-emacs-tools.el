@@ -35,12 +35,158 @@
 (require 'cl-lib)
 (require 'imenu)
 
+;; Forward declarations from the IDE MCP handler module.  The HTTP MCP tools
+;; server exposes a separate tool registry, but these functions share the same
+;; buffer bookkeeping used by the IDE protocol handlers.
+(declare-function claude-code-ide-mcp--setup-buffer-cache-hooks
+                  "claude-code-ide-mcp" ())
+
 ;; Tree-sitter declarations
 (declare-function treesit-node-at "treesit" (pos &optional parser-or-lang named))
 (declare-function treesit-node-text "treesit" (node &optional no-property))
 (declare-function treesit-node-field-name "treesit" (node))
 
 ;;; Tool Functions
+
+(defvar claude-code-ide-emacs-tools--reference-windows (make-hash-table :test 'equal)
+  "Reference windows keyed by HTTP MCP session ID.")
+
+(defvar claude-code-ide-emacs-tools--reference-overlays (make-hash-table :test 'equal)
+  "Reference highlight overlays keyed by HTTP MCP session ID.")
+
+(defun claude-code-ide-emacs-tools--line-number (line)
+  "Normalize LINE to a 1-based integer, or nil."
+  (when line
+    (max 1 (truncate line))))
+
+(defun claude-code-ide-emacs-tools--apply-location (start-line end-line start-text end-text)
+  "Apply optional text or line location in the current buffer."
+  (let ((start-line (claude-code-ide-emacs-tools--line-number start-line))
+        (end-line (claude-code-ide-emacs-tools--line-number end-line)))
+    (cond
+     ((and start-text end-text)
+      (goto-char (point-min))
+      (when (search-forward start-text nil t)
+        (let ((start-pos (match-beginning 0)))
+          (if (search-forward end-text nil t)
+              (let ((end-pos (match-end 0)))
+                (goto-char start-pos)
+                (push-mark end-pos t t)
+                (activate-mark))
+            (goto-char start-pos)))))
+     (start-text
+      (goto-char (point-min))
+      (when (search-forward start-text nil t)
+        (goto-char (match-beginning 0))))
+     (start-line
+      (goto-char (point-min))
+      (forward-line (1- start-line))
+      (when end-line
+        (push-mark (point) t t)
+        (forward-line (- end-line start-line))
+        (end-of-line)
+        (activate-mark))))))
+
+(defun claude-code-ide-mcp-open-file (path &optional start-line end-line start-text end-text)
+  "Open PATH in Emacs and optionally select a line or text range."
+  (unless path
+    (error "path parameter is required"))
+  (claude-code-ide-mcp-server-with-session-context nil
+    (find-file path)
+    (when (fboundp 'claude-code-ide-mcp--setup-buffer-cache-hooks)
+      (claude-code-ide-mcp--setup-buffer-cache-hooks))
+    (claude-code-ide-emacs-tools--apply-location
+     start-line end-line start-text end-text)
+    (format "FILE_OPENED: %s" path)))
+
+(defun claude-code-ide-emacs-tools--rightmost-editing-window (frame)
+  "Return the rightmost non-side window in FRAME."
+  (let* ((wins (cl-remove-if (lambda (w) (window-parameter w 'window-side))
+                             (window-list frame nil)))
+         (sorted (sort (copy-sequence wins)
+                       (lambda (a b) (> (window-left-column a)
+                                        (window-left-column b))))))
+    (or (car sorted) (frame-root-window frame))))
+
+(defun claude-code-ide-emacs-tools--reference-frame ()
+  "Return the frame to use for HTTP MCP reference windows."
+  (let* ((context (claude-code-ide-mcp-server-get-session-context))
+         (assistant-buffer (plist-get context :buffer))
+         (assistant-window (and (buffer-live-p assistant-buffer)
+                                (get-buffer-window assistant-buffer t)))
+         (assistant-frame (and assistant-window
+                               (window-frame assistant-window))))
+    (or (and assistant-frame
+             (cl-find-if (lambda (frame) (not (eq frame assistant-frame)))
+                         (frame-list)))
+        assistant-frame
+        (selected-frame))))
+
+(defun claude-code-ide-emacs-tools--get-or-create-reference-window ()
+  "Return the live HTTP MCP reference window for the current session."
+  (let* ((session-id (or claude-code-ide-mcp-server--current-session-id "default"))
+         (win (gethash session-id claude-code-ide-emacs-tools--reference-windows)))
+    (if (and win (window-live-p win))
+        win
+      (let* ((frame (claude-code-ide-emacs-tools--reference-frame))
+             (rightmost (claude-code-ide-emacs-tools--rightmost-editing-window frame))
+             (new-win (split-window rightmost nil 'right)))
+        (puthash session-id new-win claude-code-ide-emacs-tools--reference-windows)
+        new-win))))
+
+(defun claude-code-ide-mcp-open-reference-window
+    (path &optional line start-line end-line)
+  "Open PATH in a session-owned reference window.
+If LINE or START-LINE is provided, navigate to that line.  If START-LINE
+and END-LINE are provided, highlight that range."
+  (unless path
+    (error "path parameter is required"))
+  (let* ((session-id (or claude-code-ide-mcp-server--current-session-id "default"))
+         (win (claude-code-ide-emacs-tools--get-or-create-reference-window))
+         (existing-ov (gethash session-id
+                               claude-code-ide-emacs-tools--reference-overlays))
+         (line (claude-code-ide-emacs-tools--line-number line))
+         (start-line (claude-code-ide-emacs-tools--line-number start-line))
+         (end-line (claude-code-ide-emacs-tools--line-number end-line)))
+    (when (overlayp existing-ov)
+      (delete-overlay existing-ov))
+    (remhash session-id claude-code-ide-emacs-tools--reference-overlays)
+    (with-selected-window win
+      (find-file path)
+      (when (fboundp 'claude-code-ide-mcp--setup-buffer-cache-hooks)
+        (claude-code-ide-mcp--setup-buffer-cache-hooks))
+      (when-let ((target-line (or line start-line)))
+        (goto-char (point-min))
+        (forward-line (1- target-line))
+        (recenter 0))
+      (when (and start-line end-line)
+        (let* ((start-pos (save-excursion
+                            (goto-char (point-min))
+                            (forward-line (1- start-line))
+                            (point)))
+               (end-pos (save-excursion
+                          (goto-char (point-min))
+                          (forward-line (1- end-line))
+                          (end-of-line)
+                          (point)))
+               (ov (make-overlay start-pos end-pos)))
+          (overlay-put ov 'face 'highlight)
+          (puthash session-id ov
+                   claude-code-ide-emacs-tools--reference-overlays))))
+    (format "REFERENCE_WINDOW_OPENED: %s" path)))
+
+(defun claude-code-ide-mcp-close-reference-window ()
+  "Close the current HTTP MCP session's reference window."
+  (let* ((session-id (or claude-code-ide-mcp-server--current-session-id "default"))
+         (ov (gethash session-id claude-code-ide-emacs-tools--reference-overlays))
+         (win (gethash session-id claude-code-ide-emacs-tools--reference-windows)))
+    (when (overlayp ov)
+      (delete-overlay ov))
+    (remhash session-id claude-code-ide-emacs-tools--reference-overlays)
+    (when (and win (window-live-p win))
+      (delete-window win))
+    (remhash session-id claude-code-ide-emacs-tools--reference-windows)
+    "REFERENCE_WINDOW_CLOSED"))
 
 (defun claude-code-ide-mcp-xref-find-references (identifier file-path)
   "Find references to IDENTIFIER in the current session's project.
@@ -344,6 +490,58 @@ If INCLUDE_CHILDREN is non-nil, include child nodes."
   "Set up Emacs MCP tools for Claude Code IDE."
   (interactive)
   (setq claude-code-ide-enable-mcp-server t)
+
+  ;; Register editor navigation tools.  These mirror the IDE WebSocket tools
+  ;; so agents connected through the HTTP emacs-tools server can open files too.
+  (claude-code-ide-make-tool
+   :function #'claude-code-ide-mcp-open-file
+   :name "openFile"
+   :description "Open a file in Emacs and optionally select a range by line numbers or text patterns"
+   :args '((:name "path"
+                  :type string
+                  :description "Path to the file to open")
+           (:name "startLine"
+                  :type integer
+                  :description "Start line for selection"
+                  :optional t)
+           (:name "endLine"
+                  :type integer
+                  :description "End line for selection"
+                  :optional t)
+           (:name "startText"
+                  :type string
+                  :description "Start text pattern for selection; takes precedence over line numbers"
+                  :optional t)
+           (:name "endText"
+                  :type string
+                  :description "End text pattern for selection"
+                  :optional t)))
+
+  (claude-code-ide-make-tool
+   :function #'claude-code-ide-mcp-open-reference-window
+   :name "openReferenceWindow"
+   :description "Open or update a session-owned reference window in Emacs, showing a file at an optional line with optional highlighted range"
+   :args '((:name "path"
+                  :type string
+                  :description "Path to the file to open")
+           (:name "line"
+                  :type integer
+                  :description "Line to navigate to"
+                  :optional t)
+           (:name "startLine"
+                  :type integer
+                  :description "Start line of range to highlight"
+                  :optional t)
+           (:name "endLine"
+                  :type integer
+                  :description "End line of range to highlight; requires startLine"
+                  :optional t)))
+
+  (claude-code-ide-make-tool
+   :function #'claude-code-ide-mcp-close-reference-window
+   :name "closeReferenceWindow"
+   :description "Close the session-owned reference window in Emacs"
+   :args nil)
 
   ;; Register xref tools
   (claude-code-ide-make-tool

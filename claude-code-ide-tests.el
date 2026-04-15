@@ -2285,37 +2285,67 @@ have completed before cleanup.  Waits up to 5 seconds."
     (should (eq (plist-get (cadr normalized-tools) :function) 'test-func-new))))
 
 (ert-deftest claude-code-ide-emacs-tools-test-tool-configuration ()
-  "Test that imenu tool is properly configured."
+  "Test that Emacs HTTP MCP tools are properly configured."
   (require 'claude-code-ide-emacs-tools)
   (require 'claude-code-ide-mcp-server)
 
-  ;; Setup tools first
-  (claude-code-ide-emacs-tools-setup)
+  (let ((claude-code-ide-mcp-server-tools nil))
+    ;; Setup tools first
+    (claude-code-ide-emacs-tools-setup)
 
-  ;; Find the imenu tool in the registered tools
-  (let ((imenu-tool (cl-find-if
-                     (lambda (tool)
-                       (let ((normalized (claude-code-ide--normalize-tool-spec tool)))
-                         (eq (plist-get normalized :function)
-                             'claude-code-ide-mcp-imenu-list-symbols)))
-                     claude-code-ide-mcp-server-tools)))
-    (should imenu-tool)
+    ;; The HTTP emacs-tools server should expose file-opening tools too.
+    (dolist (tool-name '("openFile" "openReferenceWindow" "closeReferenceWindow"))
+      (should (member tool-name
+                      (claude-code-ide-mcp-server-get-tool-names))))
 
-    ;; Normalize the tool to check its properties
-    (let ((normalized (claude-code-ide--normalize-tool-spec imenu-tool)))
-      ;; Check description
-      (should (equal (plist-get normalized :description)
-                     "Navigate and explore a file's structure by listing all its functions, classes, and variables with their locations"))
+    ;; Find the imenu tool in the registered tools
+    (let ((imenu-tool (cl-find-if
+                       (lambda (tool)
+                         (let ((normalized (claude-code-ide--normalize-tool-spec tool)))
+                           (eq (plist-get normalized :function)
+                               'claude-code-ide-mcp-imenu-list-symbols)))
+                       claude-code-ide-mcp-server-tools)))
+      (should imenu-tool)
 
-      ;; Check args
-      (let ((args (plist-get normalized :args)))
-        (should (= (length args) 1))
-        (let ((file-path-arg (car args)))
-          (should (equal (plist-get file-path-arg :name) "file_path"))
-          (should (eq (plist-get file-path-arg :type) 'string))
-          (should (not (plist-get file-path-arg :optional)))
-          (should (equal (plist-get file-path-arg :description)
-                         "Path to the file to analyze for symbols")))))))
+      ;; Normalize the tool to check its properties
+      (let ((normalized (claude-code-ide--normalize-tool-spec imenu-tool)))
+        ;; Check description
+        (should (equal (plist-get normalized :description)
+                       "Navigate and explore a file's structure by listing all its functions, classes, and variables with their locations"))
+
+        ;; Check args
+        (let ((args (plist-get normalized :args)))
+          (should (= (length args) 1))
+          (let ((file-path-arg (car args)))
+            (should (equal (plist-get file-path-arg :name) "file_path"))
+            (should (eq (plist-get file-path-arg :type) 'string))
+            (should (not (plist-get file-path-arg :optional)))
+            (should (equal (plist-get file-path-arg :description)
+                           "Path to the file to analyze for symbols"))))))))
+
+(ert-deftest claude-code-ide-emacs-tools-test-open-file-tool ()
+  "Test the HTTP MCP openFile wrapper opens a file in Emacs."
+  (require 'claude-code-ide-emacs-tools)
+  (require 'claude-code-ide-mcp-server)
+  (let ((test-file (make-temp-file "claude-code-ide-open-file-" nil ".txt"
+                                   "line one\nline two\nline three\n"))
+        (session-id "test-open-file-session")
+        (claude-code-ide-mcp-server--current-session-id "test-open-file-session"))
+    (unwind-protect
+        (with-temp-buffer
+          (claude-code-ide-mcp-server-register-session
+           session-id default-directory (current-buffer))
+          (let ((result (claude-code-ide-mcp-open-file test-file 2)))
+            (should (string-match-p "FILE_OPENED" result))
+            (let ((opened-buffer (find-buffer-visiting test-file)))
+              (should opened-buffer)
+              (with-current-buffer opened-buffer
+                (should (equal (buffer-file-name) test-file))
+                (should (= (line-number-at-pos) 2))))))
+      (when-let ((buffer (find-buffer-visiting test-file)))
+        (kill-buffer buffer))
+      (remhash session-id claude-code-ide-mcp-server--sessions)
+      (delete-file test-file))))
 
 ;;; Reference Window Tests
 
